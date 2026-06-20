@@ -25,7 +25,6 @@ def _get_database_uri():
         # SQLAlchemy butuh dialect 'postgresql://', sebagian provider memberi 'postgres://'
         if uri.startswith('postgres://'):
             uri = uri.replace('postgres://', 'postgresql://', 1)
-        # psycopg2 tidak butuh ?sslmode di url biasanya sudah include, biarkan apa adanya
         return uri
     # fallback lokal (Termux / dev)
     return 'sqlite:///absen_santri.db'
@@ -69,12 +68,34 @@ def create_app():
     app.register_blueprint(panduan_bp)
     app.register_blueprint(pengaturan_bp)
 
-    from context_processors import inject_globals
-    inject_globals(app)
+    # ── Context processor digabung langsung di sini, TIDAK pakai file terpisah ──
+    # (sebelumnya di context_processors.py — digabung supaya tidak ada masalah
+    # module-not-found saat deploy ke Vercel)
+    @app.context_processor
+    def _inject_globals():
+        from models import Pengaturan, Acara
+        from flask_login import current_user
+
+        nama_pesantren = Pengaturan.get('nama_pesantren', 'Pesantren Digital')
+        tagline        = Pengaturan.get('tagline', 'Sistem Absensi Santri')
+        logo_base64    = Pengaturan.get('logo_base64', '')
+
+        acara_buka_count = 0
+        if current_user.is_authenticated:
+            try:
+                acara_buka_count = Acara.query.filter_by(status='buka').count()
+            except Exception:
+                acara_buka_count = 0
+
+        return dict(
+            nama_pesantren=nama_pesantren,
+            tagline=tagline,
+            logo_base64=logo_base64,
+            acara_buka_count=acara_buka_count,
+        )
 
     # PENTING: di Vercel (serverless) JANGAN jalankan db.create_all() / seed_data()
-    # setiap kali fungsi dipanggil — gunakan flag agar hanya jalan saat dibutuhkan,
-    # atau jalankan migrasi terpisah lewat skrip migrate.py sebelum deploy.
+    # setiap kali fungsi dipanggil — gunakan flag agar hanya jalan saat dibutuhkan.
     if os.environ.get('AUTO_MIGRATE_ON_BOOT', '').lower() in ('1', 'true', 'yes'):
         with app.app_context():
             db.create_all()
