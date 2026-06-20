@@ -1,7 +1,7 @@
 from flask import Flask
 from datetime import datetime
 from extensions import db, login_manager
-import socket, os, secrets
+import os, secrets
 
 try:
     from dotenv import load_dotenv
@@ -9,12 +9,39 @@ try:
 except ImportError:
     pass
 
+
+def _get_database_uri():
+    """
+    Ambil URI database dari environment variable.
+    Vercel Postgres / Neon / Supabase biasanya menyediakan POSTGRES_URL atau DATABASE_URL.
+    Fallback ke SQLite untuk pengembangan lokal (misal di Termux).
+    """
+    uri = (
+        os.environ.get('POSTGRES_URL')
+        or os.environ.get('DATABASE_URL')
+        or os.environ.get('POSTGRES_PRISMA_URL')
+    )
+    if uri:
+        # SQLAlchemy butuh dialect 'postgresql://', sebagian provider memberi 'postgres://'
+        if uri.startswith('postgres://'):
+            uri = uri.replace('postgres://', 'postgresql://', 1)
+        # psycopg2 tidak butuh ?sslmode di url biasanya sudah include, biarkan apa adanya
+        return uri
+    # fallback lokal (Termux / dev)
+    return 'sqlite:///absen_santri.db'
+
+
 def create_app():
     app = Flask(__name__)
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///absen_santri.db'
+    app.config['SQLALCHEMY_DATABASE_URI'] = _get_database_uri()
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        'pool_pre_ping': True,   # penting untuk koneksi serverless yang sering idle/putus
+        'pool_recycle': 280,
+    }
     app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
+
     db.init_app(app)
     login_manager.init_app(app)
     login_manager.login_view = 'auth.login'
@@ -45,45 +72,42 @@ def create_app():
     from context_processors import inject_globals
     inject_globals(app)
 
-    with app.app_context():
-        db.create_all()
-        _migrasi_db()
-        seed_data()
+    # PENTING: di Vercel (serverless) JANGAN jalankan db.create_all() / seed_data()
+    # setiap kali fungsi dipanggil — gunakan flag agar hanya jalan saat dibutuhkan,
+    # atau jalankan migrasi terpisah lewat skrip migrate.py sebelum deploy.
+    if os.environ.get('AUTO_MIGRATE_ON_BOOT', '').lower() in ('1', 'true', 'yes'):
+        with app.app_context():
+            db.create_all()
+            _migrasi_db()
+            seed_data()
+
     return app
 
 
 def _migrasi_db():
-    """Tambah kolom baru tanpa menghapus data lama."""
-    from sqlalchemy import text
+    """Tambah kolom baru tanpa menghapus data lama (aman dijalankan berulang)."""
+    from sqlalchemy import text, inspect
     migrasi = [
-        ('admin', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0'),
-        ('admin', 'dibuat',               "DATETIME DEFAULT (datetime('now'))"),
+        ('admin', 'must_change_password', 'BOOLEAN NOT NULL DEFAULT FALSE'),
+        ('admin', 'dibuat',               'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
     ]
+    inspector = inspect(db.engine)
     with db.engine.connect() as conn:
         for tabel, kolom, definisi in migrasi:
+            existing_cols = [c['name'] for c in inspector.get_columns(tabel)] if tabel in inspector.get_table_names() else []
+            if kolom in existing_cols:
+                continue
             try:
                 conn.execute(text(f'ALTER TABLE {tabel} ADD COLUMN {kolom} {definisi}'))
                 conn.commit()
             except Exception:
-                pass  # kolom sudah ada
-
-
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return '0.0.0.0'
+                pass  # kolom sudah ada atau tabel belum ada
 
 
 def seed_data():
     from models import Admin, Santri, Acara, Pengaturan
     from werkzeug.security import generate_password_hash
 
-    # Admin default
     if not Admin.query.first():
         db.session.add(Admin(
             username='admin', email='admin@pesantren.id',
@@ -92,18 +116,16 @@ def seed_data():
             must_change_password=True
         ))
 
-    # Pengaturan default
     defaults = {
         'nama_pesantren' : 'Pesantren Digital',
         'tagline'        : 'Sistem Absensi Santri',
-        'logo_base64'    : '',   # kosong = pakai emoji 🕌
+        'logo_base64'    : '',
         'tahun'          : str(datetime.today().year),
     }
     for k, v in defaults.items():
         if not Pengaturan.query.filter_by(kunci=k).first():
             db.session.add(Pengaturan(kunci=k, nilai=v))
 
-    # Santri & Acara contoh
     if not Santri.query.first():
         db.session.add_all([
             Santri(nis='PST2024001', nama='Ahmad Fauzi',    orang_tua='Bapak Hasan', alamat='Jl. Mawar No. 5, Semarang', kelas='Kelas 1A'),
@@ -119,9 +141,29 @@ def seed_data():
     db.session.commit()
 
 
+# Instance global untuk WSGI (dibutuhkan Vercel)
+app = create_app()
+
+
 if __name__ == '__main__':
-    app = create_app()
-    ip  = get_local_ip()
+    # Mode lokal (Termux / PC) — jalankan migrasi otomatis di sini saja
+    with app.app_context():
+        db.create_all()
+        _migrasi_db()
+        seed_data()
+
+    import socket
+    def get_local_ip():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return '0.0.0.0'
+
+    ip = get_local_ip()
     print(f'\n  HP ini   : http://127.0.0.1:5000')
     print(f'  HP lain  : http://{ip}:5000')
     print(f'  Login    : admin / admin123  (wajib ganti saat pertama login)\n')
