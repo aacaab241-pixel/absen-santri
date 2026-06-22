@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, jsonify
 from datetime import datetime
 from extensions import db, login_manager
 import os, secrets
@@ -22,11 +22,9 @@ def _get_database_uri():
         or os.environ.get('POSTGRES_PRISMA_URL')
     )
     if uri:
-        # SQLAlchemy butuh dialect 'postgresql://', sebagian provider memberi 'postgres://'
         if uri.startswith('postgres://'):
             uri = uri.replace('postgres://', 'postgresql://', 1)
         return uri
-    # fallback lokal (Termux / dev)
     return 'sqlite:///absen_santri.db'
 
 
@@ -36,7 +34,7 @@ def create_app():
     app.config['SQLALCHEMY_DATABASE_URI'] = _get_database_uri()
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        'pool_pre_ping': True,   # penting untuk koneksi serverless yang sering idle/putus
+        'pool_pre_ping': True,
         'pool_recycle': 280,
     }
     app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
@@ -68,9 +66,6 @@ def create_app():
     app.register_blueprint(panduan_bp)
     app.register_blueprint(pengaturan_bp)
 
-    # ── Context processor digabung langsung di sini, TIDAK pakai file terpisah ──
-    # (sebelumnya di context_processors.py — digabung supaya tidak ada masalah
-    # module-not-found saat deploy ke Vercel)
     @app.context_processor
     def _inject_globals():
         from models import Pengaturan, Acara
@@ -94,13 +89,40 @@ def create_app():
             acara_buka_count=acara_buka_count,
         )
 
-    # PENTING: di Vercel (serverless) JANGAN jalankan db.create_all() / seed_data()
-    # setiap kali fungsi dipanggil — gunakan flag agar hanya jalan saat dibutuhkan.
+    # ── ROUTE SETUP MANUAL ──────────────────────────────────────────
+    # Buka URL https://domain-kamu.vercel.app/setup di browser untuk
+    # membuat tabel + admin default secara manual. AMAN dijalankan
+    # berulang kali (tidak menghapus data yang sudah ada).
+    @app.route('/setup')
+    def _setup_route():
+        try:
+            with app.app_context():
+                db.create_all()
+                _migrasi_db()
+                seed_data()
+            return jsonify(
+                ok=True,
+                pesan='Setup berhasil! Tabel dan admin default sudah dibuat.',
+                login='username: admin / password: admin123 (wajib ganti saat login)'
+            )
+        except Exception as e:
+            import traceback
+            return jsonify(
+                ok=False,
+                error=str(e),
+                error_type=type(e).__name__,
+                traceback=traceback.format_exc()
+            ), 500
+
+    # Tetap coba auto-migrate diam-diam jika env var di-set (tidak wajib)
     if os.environ.get('AUTO_MIGRATE_ON_BOOT', '').lower() in ('1', 'true', 'yes'):
-        with app.app_context():
-            db.create_all()
-            _migrasi_db()
-            seed_data()
+        try:
+            with app.app_context():
+                db.create_all()
+                _migrasi_db()
+                seed_data()
+        except Exception:
+            pass  # biarkan, bisa di-trigger manual lewat /setup
 
     return app
 
@@ -122,7 +144,7 @@ def _migrasi_db():
                 conn.execute(text(f'ALTER TABLE {tabel} ADD COLUMN {kolom} {definisi}'))
                 conn.commit()
             except Exception:
-                pass  # kolom sudah ada atau tabel belum ada
+                pass
 
 
 def seed_data():
@@ -162,12 +184,10 @@ def seed_data():
     db.session.commit()
 
 
-# Instance global untuk WSGI (dibutuhkan Vercel)
 app = create_app()
 
 
 if __name__ == '__main__':
-    # Mode lokal (Termux / PC) — jalankan migrasi otomatis di sini saja
     with app.app_context():
         db.create_all()
         _migrasi_db()
