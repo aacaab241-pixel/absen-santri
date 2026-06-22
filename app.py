@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 from datetime import datetime
 from extensions import db, login_manager
 import os, secrets
@@ -9,13 +9,11 @@ try:
 except ImportError:
     pass
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, 'static')
+
 
 def _get_database_uri():
-    """
-    Ambil URI database dari environment variable.
-    Vercel Postgres / Neon / Supabase biasanya menyediakan POSTGRES_URL atau DATABASE_URL.
-    Fallback ke SQLite untuk pengembangan lokal (misal di Termux).
-    """
     uri = (
         os.environ.get('POSTGRES_URL')
         or os.environ.get('DATABASE_URL')
@@ -29,7 +27,7 @@ def _get_database_uri():
 
 
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='/static')
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
     app.config['SQLALCHEMY_DATABASE_URI'] = _get_database_uri()
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -89,10 +87,14 @@ def create_app():
             acara_buka_count=acara_buka_count,
         )
 
+    # ── SERVE STATIC FILES MANUAL ────────────────────────────────────
+    # Cadangan eksplisit kalau static_folder default Flask tidak
+    # ter-resolve dengan benar di lingkungan serverless Vercel.
+    @app.route('/static/<path:filename>')
+    def _serve_static(filename):
+        return send_from_directory(STATIC_DIR, filename)
+
     # ── ROUTE SETUP MANUAL ──────────────────────────────────────────
-    # Buka URL https://domain-kamu.vercel.app/setup di browser untuk
-    # membuat tabel + admin default secara manual. AMAN dijalankan
-    # berulang kali (tidak menghapus data yang sudah ada).
     @app.route('/setup')
     def _setup_route():
         try:
@@ -114,7 +116,18 @@ def create_app():
                 traceback=traceback.format_exc()
             ), 500
 
-    # Tetap coba auto-migrate diam-diam jika env var di-set (tidak wajib)
+    # ── DEBUG: cek isi folder static, untuk troubleshooting ──────────
+    @app.route('/debug-static')
+    def _debug_static():
+        try:
+            files = []
+            for root, dirs, filenames in os.walk(STATIC_DIR):
+                for f in filenames:
+                    files.append(os.path.relpath(os.path.join(root, f), STATIC_DIR))
+            return jsonify(static_dir=STATIC_DIR, exists=os.path.isdir(STATIC_DIR), files=files)
+        except Exception as e:
+            return jsonify(error=str(e), static_dir=STATIC_DIR)
+
     if os.environ.get('AUTO_MIGRATE_ON_BOOT', '').lower() in ('1', 'true', 'yes'):
         try:
             with app.app_context():
@@ -122,13 +135,12 @@ def create_app():
                 _migrasi_db()
                 seed_data()
         except Exception:
-            pass  # biarkan, bisa di-trigger manual lewat /setup
+            pass
 
     return app
 
 
 def _migrasi_db():
-    """Tambah kolom baru tanpa menghapus data lama (aman dijalankan berulang)."""
     from sqlalchemy import text, inspect
     migrasi = [
         ('admin', 'must_change_password', 'BOOLEAN NOT NULL DEFAULT FALSE'),
